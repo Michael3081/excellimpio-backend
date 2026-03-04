@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as XLImage
 
 APP_NAME = "ExcelLimpio Pro"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 MAX_UPLOAD_MB = 15
 MAX_PAGES_VISTA = 12
 RENDER_SCALE = 1.6
@@ -173,6 +173,119 @@ def _autosize_cols(ws, ncols, max_width=55):
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), max_width)
 
 
+
+
+def _extract_layout_table(pdf_bytes: bytes):
+    """Fallback extractor for PDFs that are not detected as classic tables.
+    Builds a row list from layout (word coordinates) using PyMuPDF.
+    Output: list-of-lists with header in first row.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        rows = []
+        for pno in range(len(doc)):
+            page = doc[pno]
+            words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,word_no
+
+            # Find header AP / NA near top to anchor checkbox columns
+            ap_candidates = [w for w in words if w[4] == "AP"]
+            na_candidates = [w for w in words if w[4] == "NA"]
+            ap_header = None
+            na_header = None
+            if ap_candidates and na_candidates:
+                ap_header = min(ap_candidates, key=lambda w: w[1])
+                na_same_band = [w for w in na_candidates if abs(w[1] - ap_header[1]) < 20]
+                na_header = min(na_same_band, key=lambda w: w[1]) if na_same_band else min(na_candidates, key=lambda w: w[1])
+
+            header_y = min(ap_header[1], na_header[1]) if (ap_header and na_header) else 0
+            apx = ((ap_header[0] + ap_header[2]) / 2) if ap_header else None
+            nax = ((na_header[0] + na_header[2]) / 2) if na_header else None
+
+            # Item tokens: numbers like 1, 2.1, 3.2.5 at left margin
+            item_tokens = []
+            for w in words:
+                txt = w[4]
+                if re.match(r"^\d+(\.\d+)*$", txt) and w[0] < 120 and w[1] > header_y + 5:
+                    item_tokens.append(w)
+
+            item_tokens = sorted(item_tokens, key=lambda w: (w[1], w[0]))
+
+            # De-duplicate almost identical tokens
+            filtered = []
+            for t in item_tokens:
+                if not filtered:
+                    filtered.append(t)
+                    continue
+                prev = filtered[-1]
+                if abs(t[1] - prev[1]) < 1.5 and abs(t[0] - prev[0]) < 3 and t[4] == prev[4]:
+                    continue
+                filtered.append(t)
+            item_tokens = filtered
+
+            if not item_tokens:
+                continue
+
+            for idx, t in enumerate(item_tokens):
+                y0 = t[1] - 2
+                y1 = (item_tokens[idx + 1][1] - 2) if idx + 1 < len(item_tokens) else (page.rect.height + 2)
+
+                band = [w for w in words if (w[1] >= y0 and w[1] < y1)]
+
+                # Detect checkmarks near AP/NA columns
+                xs = [w for w in band if w[4].lower() == "x" and 140 < w[0] < 260]
+                ap_mark = ""
+                na_mark = ""
+                if apx and nax:
+                    for xw in xs:
+                        cx = (xw[0] + xw[2]) / 2
+                        if abs(cx - apx) <= abs(cx - nax) and abs(cx - apx) < 25:
+                            ap_mark = "x"
+                        elif abs(cx - nax) < 25:
+                            na_mark = "x"
+
+                # Build text lines excluding the item token and standalone 'x'
+                band2 = [
+                    w for w in band
+                    if w[4].lower() != "x"
+                    and not (w[4] == t[4] and abs(w[0] - t[0]) < 3 and abs(w[1] - t[1]) < 2)
+                ]
+                band2 = sorted(band2, key=lambda w: (w[1], w[0]))
+
+                lines = []
+                current = []
+                current_y = None
+                for w in band2:
+                    y = w[1]
+                    if current_y is None or abs(y - current_y) <= 2.5:
+                        current.append(w)
+                        if current_y is None:
+                            current_y = y
+                    else:
+                        line = " ".join([cw[4] for cw in sorted(current, key=lambda z: z[0])]).strip()
+                        if line:
+                            lines.append(line)
+                        current = [w]
+                        current_y = y
+                if current:
+                    line = " ".join([cw[4] for cw in sorted(current, key=lambda z: z[0])]).strip()
+                    if line:
+                        lines.append(line)
+
+                # Heuristic: extract “responsables” lines
+                resp_tags = ("H&S", "MA", "RS", "IT", "OPA", "QA", "QC", "SSOMA", "HSE")
+                resp_lines = [ln for ln in lines if (":" in ln) and any(tag in ln for tag in resp_tags)]
+                resp = "\n".join(resp_lines).strip()
+                detail = "\n".join([ln for ln in lines if ln not in resp_lines]).strip()
+
+                rows.append([t[4], ap_mark, na_mark, resp, detail])
+
+        if rows:
+            header = ["Ítem", "AP", "NA", "Responsable", "Detalle"]
+            return [header] + rows
+        return []
+    finally:
+        doc.close()
+
 def _write_original_sheet(wb: Workbook, images):
     ws = wb.create_sheet("ORIGINAL (Vista)")
     ws.sheet_view.showGridLines = False
@@ -232,6 +345,8 @@ async def convert(file: UploadFile = File(...)):
     _write_original_sheet(wb, images)
     tables = _extract_tables(pdf_bytes)
     best_table = _choose_best_table(tables)
+    if not best_table:
+        best_table = _extract_layout_table(pdf_bytes)
     _write_editable_sheet(wb, best_table)
     wb._sheets = [wb["ORIGINAL (Vista)"], wb["EDITABLE (Tabla)"]]
 
