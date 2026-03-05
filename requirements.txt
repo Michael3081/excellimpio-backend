@@ -3,3 +3,5 @@ uvicorn
 pdfplumber
 openpyxl
 python-multipart
+pymupdf
+pillow
