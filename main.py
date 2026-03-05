@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import io
 import re
@@ -21,6 +22,16 @@ RENDER_SCALE = 1.6
 MAX_IMG_WIDTH_PX = 1200
 
 app = FastAPI(title=f"{APP_NAME} Backend", version=APP_VERSION)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
 
 @app.get("/")
 def root():
