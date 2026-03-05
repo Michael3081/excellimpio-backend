@@ -1,374 +1,317 @@
+"""
+ExcelLimpio PRO Backend (FastAPI)
+--------------------------------
+Entrega un solo XLSX con 2 hojas:
+- ORIGINAL (Vista): páginas del PDF renderizadas como imagen (fiel al original, con logos).
+- EDITABLE (Tabla): tabla principal extraída y ordenada para editar.
+
+Endpoint:
+- GET /health
+- POST /convert  (multipart/form-data: file=<pdf>)
+"""
+
+import io
+import os
+import re
+from typing import List, Optional, Tuple
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import io
-import re
-from datetime import datetime
 
 import pdfplumber
-import fitz  # PyMuPDF
-from PIL import Image as PILImage
-
+import pypdfium2 as pdfium
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.drawing.image import Image as XLImage
 
-APP_NAME = "ExcelLimpio Pro"
-APP_VERSION = "1.2.0"
-MAX_UPLOAD_MB = 15
-MAX_PAGES_VISTA = 12
-RENDER_SCALE = 1.6
-MAX_IMG_WIDTH_PX = 1200
 
-app = FastAPI(title=f"{APP_NAME} Backend", version=APP_VERSION)
+APP_TITLE = "ExcelLimpio PRO Backend"
+APP_VERSION = "9.0.0"
+
+# Seguridad/robustez básica: evita PDFs gigantes en plan gratuito
+MAX_PDF_MB = 15
+MAX_PAGES_RENDER = 10
+RENDER_SCALE = 2  # 2 ~= 144dpi; 2.5 ~= 180dpi (más pesado)
+
+app = FastAPI(title=APP_TITLE, version=APP_VERSION, description="Convierte PDF a Excel PRO (vista fiel + tabla editable).")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["*"],  # para Netlify. Luego puede cerrarlo a su dominio.
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
 )
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": f"{APP_NAME} backend activo"}
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+    return {"status": "ok", "message": "ExcelLimpio PRO backend activo", "version": APP_VERSION}
 
 
-def _safe_filename(name: str) -> str:
-    name = name or "archivo"
-    name = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip()
-    return name[:80] if len(name) > 80 else name
+def _render_pdf_pages(pdf_bytes: bytes, scale: float = RENDER_SCALE, max_pages: int = MAX_PAGES_RENDER):
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    n = len(pdf)
+    pages = []
+    for i in range(min(n, max_pages)):
+        page = pdf[i]
+        pil_img = page.render(scale=scale).to_pil()
+        pages.append(pil_img)
+    return pages, n
 
 
-def _pdf_to_images(pdf_bytes: bytes):
-    images = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        for i, page in enumerate(doc):
-            if i >= MAX_PAGES_VISTA:
-                break
-            mat = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-            if img.width > MAX_IMG_WIDTH_PX:
-                ratio = MAX_IMG_WIDTH_PX / float(img.width)
-                new_h = int(img.height * ratio)
-                img = img.resize((MAX_IMG_WIDTH_PX, new_h))
-            images.append(img)
-    finally:
-        doc.close()
-    return images
-
-
-def _extract_tables(pdf_bytes: bytes):
-    tables_out = []
+def _best_table_from_pdf(pdf_bytes: bytes) -> Optional[List[List[Optional[str]]]]:
+    """
+    Busca la tabla "más grande" (por cantidad de columnas, luego filas).
+    Devuelve la tabla como lista de filas (cada fila es lista de celdas).
+    """
+    best = None  # (cols, rows, table)
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            try:
-                tables = page.extract_tables({
-                    "vertical_strategy": "lines",
-                    "horizontal_strategy": "lines",
-                    "intersection_tolerance": 5,
-                    "snap_tolerance": 3,
-                    "join_tolerance": 3,
-                    "edge_min_length": 10,
-                    "min_words_vertical": 1,
-                    "min_words_horizontal": 1,
-                    "keep_blank_chars": False,
-                    "text_tolerance": 2,
-                }) or []
-            except Exception:
-                tables = []
-            if not tables:
-                try:
-                    tables = page.extract_tables({
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                        "snap_tolerance": 3,
-                        "join_tolerance": 3,
-                        "min_words_vertical": 1,
-                        "min_words_horizontal": 1,
-                        "keep_blank_chars": False,
-                        "text_tolerance": 2,
-                    }) or []
-                except Exception:
-                    tables = []
-            for t in tables:
-                if t and any(any(c not in (None, "", " ") for c in row) for row in t):
-                    tables_out.append(t)
-    return tables_out
+            for table in page.extract_tables():
+                if not table:
+                    continue
+                rows = len(table)
+                cols = max(len(r) for r in table)
+                score = (cols, rows)
+                if best is None or score > (best[0], best[1]):
+                    best = (cols, rows, table)
+    return None if best is None else best[2]
 
 
-def _clean_table(table):
-    norm = []
-    for row in table:
-        r = []
-        for c in row:
-            if c is None:
-                r.append("")
-            else:
-                s = str(c)
-                s = re.sub(r"\s+", " ", s).strip()
-                r.append(s)
-        norm.append(r)
-    norm = [r for r in norm if any(cell != "" for cell in r)]
-    if not norm:
-        return []
-    max_len = max(len(r) for r in norm)
-    norm = [r + [""] * (max_len - len(r)) for r in norm]
-    keep_cols = []
-    for j in range(max_len):
-        col = [r[j] for r in norm]
-        if any(v != "" for v in col):
-            keep_cols.append(j)
-    if not keep_cols:
-        return []
-    return [[r[j] for j in keep_cols] for r in norm]
-
-
-def _choose_best_table(tables):
-    best = []
-    best_score = 0
-    for t in tables:
-        ct = _clean_table(t)
-        if not ct:
-            continue
-        score = sum(1 for r in ct for c in r if c != "") + len(ct[0]) * 10
-        if score > best_score:
-            best_score = score
-            best = ct
-    return best
-
-
-def _style_header(ws, row=1, ncols=1):
-    fill = PatternFill("solid", fgColor="1F4E79")
-    font = Font(color="FFFFFF", bold=True)
-    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin = Side(style="thin", color="9E9E9E")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    ws.row_dimensions[row].height = 22
-    for c in range(1, ncols + 1):
-        cell = ws.cell(row=row, column=c)
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = align
-        cell.border = border
-
-
-def _style_body(ws, start_row, end_row, ncols):
-    thin = Side(style="thin", color="D0D0D0")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for r in range(start_row, end_row + 1):
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = border
-
-
-def _autosize_cols(ws, ncols, max_width=55):
-    for c in range(1, ncols + 1):
-        col_letter = get_column_letter(c)
-        max_len = 0
-        for cell in ws[col_letter]:
-            if cell.value is None:
-                continue
-            max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), max_width)
-
-
-
-
-def _extract_layout_table(pdf_bytes: bytes):
-    """Fallback extractor for PDFs that are not detected as classic tables.
-    Builds a row list from layout (word coordinates) using PyMuPDF.
-    Output: list-of-lists with header in first row.
+def _map_table_to_editable(table: List[List[Optional[str]]]) -> List[List[str]]:
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        rows = []
-        for pno in range(len(doc)):
-            page = doc[pno]
-            words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,word_no
+    Mapea la tabla detectada a columnas estándar:
+    [N°, Actividad, AP, NA, Responsable, Emisor(Proyectos), Emisor(Operaciones), Observaciones, Nombre Emisor (Yanacocha)]
 
-            # Find header AP / NA near top to anchor checkbox columns
-            ap_candidates = [w for w in words if w[4] == "AP"]
-            na_candidates = [w for w in words if w[4] == "NA"]
-            ap_header = None
-            na_header = None
-            if ap_candidates and na_candidates:
-                ap_header = min(ap_candidates, key=lambda w: w[1])
-                na_same_band = [w for w in na_candidates if abs(w[1] - ap_header[1]) < 20]
-                na_header = min(na_same_band, key=lambda w: w[1]) if na_same_band else min(na_candidates, key=lambda w: w[1])
+    Nota importante:
+    En algunos PDFs (como el checklist de prueba), la última columna trae varios valores "apilados" en una fila
+    de "título de sección" (p.ej. la fila "2") y deja en blanco las filas 2.1, 2.2, 2.3, 2.4.
+    Aquí corregimos ese corrimiento distribuyendo OPA / IT / H&S / SC a sus filas correspondientes.
+    """
+    mapped: List[List[str]] = []
 
-            header_y = min(ap_header[1], na_header[1]) if (ap_header and na_header) else 0
-            apx = ((ap_header[0] + ap_header[2]) / 2) if ap_header else None
-            nax = ((na_header[0] + na_header[2]) / 2) if na_header else None
+    def s(x: Optional[str]) -> str:
+        return (x or "").strip()
 
-            # Item tokens: numbers like 1, 2.1, 3.2.5 at left margin
-            item_tokens = []
-            for w in words:
-                txt = w[4]
-                if re.match(r"^\d+(\.\d+)*$", txt) and w[0] < 120 and w[1] > header_y + 5:
-                    item_tokens.append(w)
+    # 1) mapping base (según posiciones típicas del PDF de prueba)
+    for r in table:
+        if not r or not r[0]:
+            continue
+        first = s(r[0])
+        if not re.match(r"^\d+(\.\d+)?$", first):
+            continue
 
-            item_tokens = sorted(item_tokens, key=lambda w: (w[1], w[0]))
+        rr = list(r) + [""] * (12 - len(r))  # padding
+        mapped.append([
+            s(rr[0]),   # N°
+            s(rr[1]),   # Actividad
+            s(rr[5]),   # AP
+            s(rr[6]),   # NA
+            s(rr[7]),   # Responsable
+            s(rr[8]),   # Emisor (Proyectos)
+            s(rr[9]),   # Emisor (Operaciones)
+            s(rr[10]),  # Observaciones
+            s(rr[11]),  # Nombre Emisor (Yanacocha)
+        ])
 
-            # De-duplicate almost identical tokens
-            filtered = []
-            for t in item_tokens:
-                if not filtered:
-                    filtered.append(t)
-                    continue
-                prev = filtered[-1]
-                if abs(t[1] - prev[1]) < 1.5 and abs(t[0] - prev[0]) < 3 and t[4] == prev[4]:
-                    continue
-                filtered.append(t)
-            item_tokens = filtered
+    # 2) corrección de corrimiento en "Nombre Emisor (Yanacocha)" para secciones con sub-items
+    def normalize_key(k: str) -> str:
+        k = k.strip()
+        k = k.replace(" ", "")
+        return k.upper()
 
-            if not item_tokens:
-                continue
+    def key_from_emisor_proy(txt: str) -> Optional[str]:
+        u = txt.upper()
+        if "(OPA" in u or u.strip() == "OPA":
+            return "OPA"
+        if u.strip() == "TI":
+            return "IT"
+        if "H&S" in u or u.strip() == "HS":
+            return "H&S"
+        if "SUPPLY" in u or "(SC" in u or u.strip() == "SC":
+            return "SC"
+        return None
 
-            for idx, t in enumerate(item_tokens):
-                y0 = t[1] - 2
-                y1 = (item_tokens[idx + 1][1] - 2) if idx + 1 < len(item_tokens) else (page.rect.height + 2)
+    i = 0
+    while i < len(mapped):
+        n = mapped[i][0]
+        # detecta fila "sección" (entero sin punto) con col. final multi-línea
+        if re.match(r"^\d+$", n):
+            last = mapped[i][8] or ""
+            lines = [ln.strip() for ln in last.splitlines() if ln.strip()]
+            looks_like_bundle = len(lines) >= 2 and any((":" in ln) or (ln.upper() in {"OPA"}) for ln in lines)
 
-                band = [w for w in words if (w[1] >= y0 and w[1] < y1)]
+            # fila sección: muchas columnas vacías + bundle en última col
+            empties = sum(1 for x in mapped[i][2:8] if not (x or "").strip())
+            if looks_like_bundle and empties >= 5:
+                prefix = f"{n}."
+                j = i + 1
+                sub_idx = []
+                while j < len(mapped) and mapped[j][0].startswith(prefix):
+                    sub_idx.append(j)
+                    j += 1
 
-                # Detect checkmarks near AP/NA columns
-                xs = [w for w in band if w[4].lower() == "x" and 140 < w[0] < 260]
-                ap_mark = ""
-                na_mark = ""
-                if apx and nax:
-                    for xw in xs:
-                        cx = (xw[0] + xw[2]) / 2
-                        if abs(cx - apx) <= abs(cx - nax) and abs(cx - apx) < 25:
-                            ap_mark = "x"
-                        elif abs(cx - nax) < 25:
-                            na_mark = "x"
-
-                # Build text lines excluding the item token and standalone 'x'
-                band2 = [
-                    w for w in band
-                    if w[4].lower() != "x"
-                    and not (w[4] == t[4] and abs(w[0] - t[0]) < 3 and abs(w[1] - t[1]) < 2)
-                ]
-                band2 = sorted(band2, key=lambda w: (w[1], w[0]))
-
-                lines = []
-                current = []
-                current_y = None
-                for w in band2:
-                    y = w[1]
-                    if current_y is None or abs(y - current_y) <= 2.5:
-                        current.append(w)
-                        if current_y is None:
-                            current_y = y
+                # armamos diccionario key->texto
+                token_map = {}
+                for ln in lines:
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        token_map[normalize_key(k)] = ln.strip()
                     else:
-                        line = " ".join([cw[4] for cw in sorted(current, key=lambda z: z[0])]).strip()
-                        if line:
-                            lines.append(line)
-                        current = [w]
-                        current_y = y
-                if current:
-                    line = " ".join([cw[4] for cw in sorted(current, key=lambda z: z[0])]).strip()
-                    if line:
-                        lines.append(line)
+                        token_map[normalize_key(ln)] = ln.strip()
 
-                # Heuristic: extract “responsables” lines
-                resp_tags = ("H&S", "MA", "RS", "IT", "OPA", "QA", "QC", "SSOMA", "HSE")
-                resp_lines = [ln for ln in lines if (":" in ln) and any(tag in ln for tag in resp_tags)]
-                resp = "\n".join(resp_lines).strip()
-                detail = "\n".join([ln for ln in lines if ln not in resp_lines]).strip()
+                # distribuimos sólo si hay subitems y éstos están vacíos en la última col
+                if sub_idx:
+                    for sj in sub_idx:
+                        if (mapped[sj][8] or "").strip():
+                            continue
+                        k = key_from_emisor_proy(mapped[sj][5])
+                        if not k:
+                            continue
+                        hit = token_map.get(normalize_key(k))
+                        if hit:
+                            mapped[sj][8] = hit
+                            # opcional: eliminar para no reusar
+                            token_map.pop(normalize_key(k), None)
 
-                rows.append([t[4], ap_mark, na_mark, resp, detail])
+                    # la fila de sección no debe cargar valores de emisores
+                    mapped[i][8] = ""
 
-        if rows:
-            header = ["Ítem", "AP", "NA", "Responsable", "Detalle"]
-            return [header] + rows
-        return []
-    finally:
-        doc.close()
+        i += 1
 
-def _write_original_sheet(wb: Workbook, images):
-    ws = wb.create_sheet("ORIGINAL (Vista)")
-    ws.sheet_view.showGridLines = False
-    ws.column_dimensions["A"].width = 180
-    row = 1
-    for idx, img in enumerate(images, start=1):
-        ws.cell(row=row, column=1, value=f"Página {idx}").font = Font(bold=True)
-        row += 1
-        ximg = XLImage(img)
-        ws.add_image(ximg, f"A{row}")
-        img_h = img.height
-        points = img_h * 0.75
-        ws.row_dimensions[row].height = min(max(points, 15), 409)
-        row += int(max(20, img_h / 18)) + 2
-    return ws
+    return mapped
 
+def _build_workbook(pdf_filename: str, pdf_bytes: bytes) -> bytes:
+    # 1) Render de páginas
+    pages, total_pages = _render_pdf_pages(pdf_bytes, scale=RENDER_SCALE, max_pages=MAX_PAGES_RENDER)
 
-def _write_editable_sheet(wb: Workbook, table):
+    # 2) Tabla editable
+    raw_table = _best_table_from_pdf(pdf_bytes)
+    editable_rows = _map_table_to_editable(raw_table) if raw_table else []
+
+    wb = Workbook()
+
+    # --------------------
+    # Sheet ORIGINAL (Vista)
+    # --------------------
+    ws_o = wb.active
+    ws_o.title = "ORIGINAL (Vista)"
+
+    # “grid” para que el zoom sea cómodo (no afecta la imagen)
+    for col in range(1, 15):
+        ws_o.column_dimensions[get_column_letter(col)].width = 3.0
+    for r in range(1, 500):
+        ws_o.row_dimensions[r].height = 12
+
+    start_row = 1
+    approx_row_px = 16  # 12pt ≈ 16px
+    for pil_img in pages:
+        bio = io.BytesIO()
+        pil_img.save(bio, format="PNG")
+        bio.seek(0)
+        xlimg = XLImage(bio)
+        ws_o.add_image(xlimg, f"A{start_row}")
+
+        # bajar para la siguiente página
+        start_row += int(pil_img.size[1] / approx_row_px) + 8
+
+    if total_pages > MAX_PAGES_RENDER:
+        ws_o["A1"] = f"Nota: se renderizaron solo {MAX_PAGES_RENDER} de {total_pages} páginas (para rendimiento)."
+        ws_o["A1"].font = Font(bold=True, color="C00000")
+
+    # --------------------
+    # Sheet EDITABLE (Tabla)
+    # --------------------
     ws = wb.create_sheet("EDITABLE (Tabla)")
-    if not table:
-        ws["A1"] = "No se detectó una tabla editable clara en este PDF."
-        return ws
-    header = table[0]
-    body = table[1:] if len(table) > 1 else []
-    non_empty = sum(1 for x in header if x)
-    if non_empty < max(2, len(header)//3):
-        header = [f"Col {i+1}" for i in range(len(header))]
-        body = table
-    for c, val in enumerate(header, start=1):
-        ws.cell(row=1, column=c, value=val)
-    for r_idx, row in enumerate(body, start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx, value=val)
-    ncols = len(header)
-    _style_header(ws, row=1, ncols=ncols)
-    _style_body(ws, start_row=2, end_row=max(2, len(body)+1), ncols=ncols)
-    _autosize_cols(ws, ncols=ncols)
-    ws.freeze_panes = "A2"
-    return ws
+    ws["A1"] = "ExcelLimpio PRO - Editable"
+    ws["A2"] = f"Archivo: {pdf_filename}"
+    ws["A1"].font = Font(size=14, bold=True)
+    ws["A2"].font = Font(italic=True, color="666666")
+    ws.merge_cells("A1:I1")
+    ws.merge_cells("A2:I2")
+
+    headers = [
+        "N°",
+        "Actividad",
+        "AP",
+        "NA",
+        "Responsable",
+        "Emisor (Proyectos)",
+        "Emisor (Operaciones)",
+        "Observaciones",
+        "Nombre Emisor (Yanacocha)",
+    ]
+
+    header_row = 4
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(header_row, c, h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+    ws.row_dimensions[header_row].height = 28
+
+    # data
+    start = header_row + 1
+    for i, row in enumerate(editable_rows, start=start):
+        for c, val in enumerate(row, start=1):
+            cell = ws.cell(i, c, val)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # grid / borders
+    thin = Side(style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    last_row = max(start, start + len(editable_rows) - 1)
+    for r in range(header_row, last_row + 1):
+        ws.row_dimensions[r].height = 18
+        for c in range(1, 10):
+            ws.cell(r, c).border = border
+
+    # column widths
+    widths = [6, 60, 4, 4, 18, 22, 22, 60, 26]
+    for c, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+    # center small cols
+    for r in range(start, last_row + 1):
+        for c in (1, 3, 4):
+            ws.cell(r, c).alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+
+    ws.freeze_panes = "A5"
+
+    # output bytes
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
 
 
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="Archivo no recibido")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Suba un archivo .pdf")
+
     pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Archivo vacío")
-    if len(pdf_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Archivo supera {MAX_UPLOAD_MB} MB")
-    if not (file.filename.lower().endswith(".pdf") or pdf_bytes[:4] == b"%PDF"):
-        raise HTTPException(status_code=400, detail="Solo se acepta PDF")
+    size_mb = len(pdf_bytes) / (1024 * 1024)
+    if size_mb > MAX_PDF_MB:
+        raise HTTPException(status_code=413, detail=f"PDF demasiado grande ({size_mb:.1f} MB). Límite: {MAX_PDF_MB} MB")
 
-    wb = Workbook()
-    wb.remove(wb.active)
-    images = _pdf_to_images(pdf_bytes)
-    _write_original_sheet(wb, images)
-    tables = _extract_tables(pdf_bytes)
-    best_table = _choose_best_table(tables)
-    if not best_table:
-        best_table = _extract_layout_table(pdf_bytes)
-    _write_editable_sheet(wb, best_table)
-    wb._sheets = [wb["ORIGINAL (Vista)"], wb["EDITABLE (Tabla)"]]
+    try:
+        xlsx_bytes = _build_workbook(file.filename, pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando el PDF: {e}")
 
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    base = _safe_filename(file.filename).rsplit(".", 1)[0]
-    out_name = f"{base}_ExcelLimpio_PRO.xlsx"
+    out_name = os.path.splitext(file.filename)[0] + "_ExcelLimpio_PRO.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
 
     return StreamingResponse(
-        out,
+        io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
+        headers=headers,
     )
