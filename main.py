@@ -245,123 +245,80 @@ def _add_original_sheet(ws_orig, pdf, resolution: int = 160) -> None:
         y += int(pts / 15) + 4
 
 
-def _build_workbook(pdf_bytes: bytes, original_name: str) -> bytes:
-    """Create the PRO xlsx as bytes."""
+def _build_workbook(pdf_bytes: bytes) -> bytes:
+    """Return an XLSX with:
+      - ORIGINAL: page images (faithful PDF view)
+      - One EDITABLE sheet per detected table (to avoid tables "breaking" when stacked).
+    """
+    import io as _io
+
+    def _sanitize_sheet_name(name: str, existing: set[str]) -> str:
+        # Excel sheet name constraints: <=31 chars; cannot contain : \ / ? * [ ]
+        name = re.sub(r'[:\\/*?\[\]]', '_', name).strip()
+        if not name:
+            name = "EDITABLE"
+        name = name[:31]
+        base = name
+        k = 2
+        while name in existing:
+            suffix = f"_{k}"
+            name = (base[: (31 - len(suffix))] + suffix) if len(base) + len(suffix) > 31 else (base + suffix)
+            k += 1
+        return name
 
     wb = openpyxl.Workbook()
     ws_orig = wb.active
     ws_orig.title = "ORIGINAL"
-    ws_edit = wb.create_sheet("EDITABLE")
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # 1) ORIGINAL
-        _add_original_sheet(ws_orig, pdf)
+    with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+        # 1) ORIGINAL sheet: images of each PDF page
+        _add_original_sheet(ws_orig, pdf, resolution=160)
 
-        # 2) EDITABLE
-        cur_row = 1
-        col_pts_master: Optional[List[float]] = None
-
+        # 2) Collect all tables (across all pages)
+        table_specs = []  # (pageno, tidx, grid, merges, col_pts, row_pts)
         for pageno, page in enumerate(pdf.pages, start=1):
             tables = _pick_tables(page)
+            for tidx, t in enumerate(tables, start=1):
+                try:
+                    grid, merges, col_pts, row_pts = _table_to_grid(page, t)
+                except Exception:
+                    continue
 
-            # Words for non-table text
-            words = page.extract_words(keep_blank_chars=False, use_text_flow=True) or []
+                # Skip empty grids
+                if (not grid) or all(
+                    all((c is None) or (str(c).strip() == "") for c in row)
+                    for row in grid
+                ):
+                    continue
 
-            # If there is a "main" table, use its bbox to split top/bottom text
-            main_table = None
-            if tables:
-                def _area(t):
-                    x0, top, x1, bottom = t.bbox
-                    return (x1 - x0) * (bottom - top)
-                main_table = max(tables, key=_area)
+                table_specs.append((pageno, tidx, grid, merges, col_pts, row_pts))
 
-            if main_table:
-                x0, top, x1, bottom = main_table.bbox
-                margin = 6
-                top_words = [w for w in words if w.get('bottom', w['top']) < top - margin]
-                bottom_words = [w for w in words if w['top'] > bottom + margin]
-            else:
-                top_words = words
-                bottom_words = []
+        # 3) Write each table in its own sheet
+        if not table_specs:
+            ws = wb.create_sheet("EDITABLE")
+            ws["A1"] = "No se detectaron tablas en este PDF."
+        else:
+            multi = len(table_specs) > 1
+            existing = set(wb.sheetnames)
+            for idx, (pageno, tidx, grid, merges, col_pts, row_pts) in enumerate(table_specs, start=1):
+                if not multi:
+                    raw_name = "EDITABLE"
+                else:
+                    raw_name = f"EDIT_P{pageno:02d}_T{tidx:02d}"
+                name = _sanitize_sheet_name(raw_name, existing)
+                existing.add(name)
 
-            # If this is not the first page, add a print page break without inserting extra text.
-            if cur_row > 1:
-                ws_edit.row_breaks.append(Break(id=cur_row))
-                cur_row += 1
+                ws = wb.create_sheet(name)
+                _set_column_widths(ws, col_pts, total_excel_width=150)
 
-            # --- Top text lines ---
-            top_lines = _extract_lines(top_words)
-            for line in top_lines:
-                ws_edit.cell(row=cur_row, column=1, value=line).font = BASE_FONT
-                # merge across a reasonable width (will expand after we know column count)
-                ws_edit.row_dimensions[cur_row].height = 15
-                cur_row += 1
+                # Set row heights to match the PDF table geometry (best effort)
+                _set_row_heights(ws, row_pts, start_row=1)
 
-            # --- Tables ---
-            if tables:
-                # Choose a representative table for column widths (largest).
-                def _area(t):
-                    x0, top, x1, bottom = t.bbox
-                    return (x1 - x0) * (bottom - top)
+                _write_table(ws, grid, start_row=1, start_col=1, merges=merges)
 
-                rep = max(tables, key=_area)
-                grid, merges, col_pts, row_pts = _table_to_grid(page, rep)
-
-                # Initialize column widths from the first representative table.
-                if col_pts_master is None:
-                    col_pts_master = col_pts
-                    _set_column_widths(ws_edit, col_pts_master, total_excel_width=150)
-
-                start_row = cur_row
-                _write_table(ws_edit, grid, merges, start_row=start_row)
-                _set_row_heights(ws_edit, row_pts, start_row=start_row)
-                cur_row = start_row + len(grid)
-
-                # If there are other tables on the page, append below (best-effort).
-                others = [t for t in tables if t is not rep]
-                for t in others:
-                    cur_row += 2
-                    g2, m2, col_pts2, row_pts2 = _table_to_grid(page, t)
-                    # If table has more columns than current, extend widths.
-                    if col_pts_master is not None and len(col_pts2) > len(col_pts_master):
-                        # Extend with proportional widths
-                        extra = col_pts2[len(col_pts_master):]
-                        col_pts_master = col_pts_master + extra
-                        _set_column_widths(ws_edit, col_pts_master, total_excel_width=150)
-                    s2 = cur_row
-                    _write_table(ws_edit, g2, m2, start_row=s2)
-                    _set_row_heights(ws_edit, row_pts2, start_row=s2)
-                    cur_row = s2 + len(g2)
-
-            # --- Bottom text lines ---
-            bottom_lines = _extract_lines(bottom_words)
-            if bottom_lines:
-                cur_row += 1
-                for line in bottom_lines:
-                    ws_edit.cell(row=cur_row, column=1, value=line).font = BASE_FONT
-                    ws_edit.row_dimensions[cur_row].height = 15
-                    cur_row += 1
-
-        # Merge text lines across all columns (after widths are known)
-        max_col = max(1, ws_edit.max_column)
-        for r in range(1, ws_edit.max_row + 1):
-            # If row has only col A populated and the rest empty, treat as a text line and merge.
-            if ws_edit.cell(r, 1).value and all(ws_edit.cell(r, c).value in (None, "") for c in range(2, max_col + 1)):
-                if max_col > 1:
-                    ws_edit.merge_cells(start_row=r, start_column=1, end_row=r, end_column=max_col)
-                ws_edit.cell(r, 1).alignment = Alignment(vertical="top", wrap_text=True)
-
-    # Write to bytes
-    out = io.BytesIO()
+    out = _io.BytesIO()
     wb.save(out)
-    out.seek(0)
-    return out.read()
-
-
-# ------------------------
-# API
-# ------------------------
-
+    return out.getvalue()
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
     name = file.filename or "archivo.pdf"
