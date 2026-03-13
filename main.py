@@ -10,7 +10,7 @@ from typing import List, Tuple, Optional
 import pdfplumber
 import psycopg
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
@@ -20,7 +20,7 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.1.0")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.2.0")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://TU-SITIO.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
@@ -541,6 +541,17 @@ def validate_payment_for_purchase(payment: dict, purchase_id: str) -> None:
         raise HTTPException(status_code=400, detail="El monto pagado no coincide con el plan.")
 
 
+def activate_purchase_from_payment_id(payment_id: str):
+    payment = get_payment(payment_id)
+    purchase_id = str(payment.get("external_reference") or "").strip()
+
+    if not purchase_id:
+        return None
+
+    validate_payment_for_purchase(payment, purchase_id)
+    return create_access_token_for_purchase(purchase_id, payment_id)
+
+
 def parse_auth_token(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Falta Authorization Bearer token.")
@@ -631,6 +642,57 @@ def api_activate_payment(payload: ActivatePaymentRequest):
         "remaining_pages": token_row["remaining_pages"],
         "max_file_size_mb": token_row["max_file_size_mb"],
     }
+
+
+@app.post("/webhooks/mercadopago")
+async def mercado_pago_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    payment_id = (
+        request.query_params.get("data.id")
+        or request.query_params.get("id")
+        or ((body.get("data") or {}).get("id") if isinstance(body, dict) else None)
+        or (body.get("id") if isinstance(body, dict) else None)
+    )
+
+    action = (
+        request.query_params.get("type")
+        or (body.get("type") if isinstance(body, dict) else None)
+        or (body.get("action") if isinstance(body, dict) else None)
+    )
+
+    if action and "payment" not in str(action):
+        return {
+            "received": True,
+            "ignored": True,
+            "reason": "not a payment event",
+            "action": action
+        }
+
+    if not payment_id:
+        return {
+            "received": True,
+            "ignored": True,
+            "reason": "payment_id not found"
+        }
+
+    try:
+        activate_purchase_from_payment_id(str(payment_id))
+        return {
+            "received": True,
+            "processed": True,
+            "payment_id": str(payment_id)
+        }
+    except HTTPException as e:
+        return {
+            "received": True,
+            "processed": False,
+            "payment_id": str(payment_id),
+            "detail": str(e.detail)
+        }
 
 
 @app.get("/api/session")
