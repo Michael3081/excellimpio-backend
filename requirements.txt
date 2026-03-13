@@ -1,7 +1,7 @@
 fastapi
 uvicorn
+python-multipart
 pdfplumber
 openpyxl
-python-multipart
-pymupdf
-pillow
+Pillow
+requests
