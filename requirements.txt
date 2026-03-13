@@ -5,3 +5,4 @@ pdfplumber
 openpyxl
 Pillow
 requests
+psycopg[binary]
