@@ -1,7 +1,6 @@
 import io
 import os
 import re
-import sqlite3
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -9,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Optional
 
 import pdfplumber
+import psycopg
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,13 +17,14 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
 from openpyxl.utils import get_column_letter
+from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.0.0")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.1.0")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://TU-SITIO.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "excellimpio.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,38 +35,10 @@ app.add_middleware(
 )
 
 PLANS = {
-    "p3": {
-        "name": "Hasta 3 páginas",
-        "price": 14.90,
-        "max_pages": 3,
-        "max_size_mb": 5,
-        "duration_days": 1,
-        "one_time": True,
-    },
-    "p10": {
-        "name": "Hasta 10 páginas",
-        "price": 24.90,
-        "max_pages": 10,
-        "max_size_mb": 10,
-        "duration_days": 1,
-        "one_time": True,
-    },
-    "p25": {
-        "name": "Hasta 25 páginas",
-        "price": 39.90,
-        "max_pages": 25,
-        "max_size_mb": 20,
-        "duration_days": 1,
-        "one_time": True,
-    },
-    "monthly": {
-        "name": "Mensual 30 días",
-        "price": 99.90,
-        "max_pages": 300,
-        "max_size_mb": 20,
-        "duration_days": 30,
-        "one_time": False,
-    },
+    "p3": {"name": "Hasta 3 páginas", "price": 14.90, "max_pages": 3, "max_size_mb": 5, "duration_days": 1, "one_time": True},
+    "p10": {"name": "Hasta 10 páginas", "price": 24.90, "max_pages": 10, "max_size_mb": 10, "duration_days": 1, "one_time": True},
+    "p25": {"name": "Hasta 25 páginas", "price": 39.90, "max_pages": 25, "max_size_mb": 20, "duration_days": 1, "one_time": True},
+    "monthly": {"name": "Mensual 30 días", "price": 99.90, "max_pages": 300, "max_size_mb": 20, "duration_days": 30, "one_time": False},
 }
 
 thin_side = Side(style="thin", color="000000")
@@ -92,8 +65,9 @@ def iso(dt: datetime) -> str:
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
+    if not DATABASE_URL:
+        raise RuntimeError("Falta configurar DATABASE_URL en Render.")
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
         yield conn
         conn.commit()
@@ -107,7 +81,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS purchases (
             id TEXT PRIMARY KEY,
             plan_code TEXT NOT NULL,
-            price REAL NOT NULL,
+            price DOUBLE PRECISION NOT NULL,
             status TEXT NOT NULL,
             payment_id TEXT,
             created_at TEXT NOT NULL,
@@ -117,7 +91,7 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS access_tokens (
             token TEXT PRIMARY KEY,
-            purchase_id TEXT NOT NULL,
+            purchase_id TEXT NOT NULL REFERENCES purchases(id),
             plan_code TEXT NOT NULL,
             plan_name TEXT NOT NULL,
             remaining_pages INTEGER,
@@ -125,8 +99,7 @@ def init_db():
             expires_at TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1,
             used_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (purchase_id) REFERENCES purchases(id)
+            created_at TEXT NOT NULL
         )
         """)
 
@@ -156,11 +129,7 @@ def _bbox_area(b: Tuple[float, float, float, float]) -> float:
     return max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1]))
 
 
-def _bbox_contains(
-    a: Tuple[float, float, float, float],
-    b: Tuple[float, float, float, float],
-    margin: float = 2.0
-) -> bool:
+def _bbox_contains(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], margin: float = 2.0) -> bool:
     return (
         b[0] >= a[0] - margin
         and b[1] >= a[1] - margin
@@ -313,18 +282,23 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
     ys = sorted(_cluster(ys, tol=1.0))
     if len(xs) < 2 or len(ys) < 2:
         return
+
     col_pts = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
     row_pts = [ys[j + 1] - ys[j] for j in range(len(ys) - 1)]
+
     for i, wpt in enumerate(col_pts):
         ws.column_dimensions[get_column_letter(1 + i)].width = _points_to_excel_col_width(wpt)
+
     for j, hpt in enumerate(row_pts):
         ws.row_dimensions[1 + j].height = max(6.0, min(hpt, 409.0))
+
     wrap = Alignment(wrap_text=True, vertical="top")
     for r in range(1, len(ys)):
         for c in range(1, len(xs)):
             cell = ws.cell(row=r, column=c)
             cell.alignment = wrap
             cell.border = thin_border
+
     for bbox in table.cells:
         x0, top, x1, bottom = bbox
         c0 = _find_index(xs, x0)
@@ -335,6 +309,7 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
         end_col = max(start_col, c1)
         start_row = r0 + 1
         end_row = max(start_row, r1)
+
         if end_row > start_row or end_col > start_col:
             ws.merge_cells(
                 start_row=start_row,
@@ -342,9 +317,11 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
                 end_row=end_row,
                 end_column=end_col
             )
+
         txt = _extract_text_in_bbox(page, bbox)
         if txt:
             ws.cell(row=start_row, column=start_col, value=txt)
+
     if style_header:
         vals = [ws.cell(row=1, column=c).value for c in range(1, len(xs))]
         nonempty = sum(1 for v in vals if v and str(v).strip())
@@ -381,13 +358,7 @@ def convert_pdf_to_xlsx_bytes(pdf_path: str) -> bytes:
                 _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}_text")
                 continue
             for t_idx, table in enumerate(tables, start=1):
-                _add_table_sheet(
-                    wb,
-                    page,
-                    table,
-                    sheet_name=f"EDITABLE_p{p_idx}_t{t_idx}",
-                    style_header=True
-                )
+                _add_table_sheet(wb, page, table, sheet_name=f"EDITABLE_p{p_idx}_t{t_idx}", style_header=True)
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -415,7 +386,7 @@ def create_purchase(plan_code: str) -> str:
     purchase_id = str(uuid.uuid4())
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO purchases (id, plan_code, price, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO purchases (id, plan_code, price, status, created_at) VALUES (%s, %s, %s, %s, %s)",
             (purchase_id, plan_code, plan["price"], "pending", iso(utcnow()))
         )
     return purchase_id
@@ -495,7 +466,7 @@ def get_payment(payment_id: str) -> dict:
 def create_access_token_for_purchase(purchase_id: str, payment_id: str) -> dict:
     with get_db() as conn:
         purchase = conn.execute(
-            "SELECT * FROM purchases WHERE id = ?",
+            "SELECT * FROM purchases WHERE id = %s",
             (purchase_id,)
         ).fetchone()
 
@@ -504,11 +475,11 @@ def create_access_token_for_purchase(purchase_id: str, payment_id: str) -> dict:
 
         if purchase["status"] == "paid":
             existing = conn.execute(
-                "SELECT * FROM access_tokens WHERE purchase_id = ? AND active = 1 ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM access_tokens WHERE purchase_id = %s AND active = 1 ORDER BY created_at DESC LIMIT 1",
                 (purchase_id,)
             ).fetchone()
             if existing:
-                return dict(existing)
+                return existing
 
         plan = get_plan(purchase["plan_code"])
         token = str(uuid.uuid4())
@@ -519,7 +490,7 @@ def create_access_token_for_purchase(purchase_id: str, payment_id: str) -> dict:
         conn.execute("""
             INSERT INTO access_tokens
             (token, purchase_id, plan_code, plan_name, remaining_pages, max_file_size_mb, expires_at, active, used_count, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 1, 0, %s)
         """, (
             token,
             purchase_id,
@@ -532,16 +503,16 @@ def create_access_token_for_purchase(purchase_id: str, payment_id: str) -> dict:
         ))
 
         conn.execute(
-            "UPDATE purchases SET status = ?, payment_id = ?, activated_at = ? WHERE id = ?",
+            "UPDATE purchases SET status = %s, payment_id = %s, activated_at = %s WHERE id = %s",
             ("paid", payment_id, iso(created_at), purchase_id)
         )
 
         row = conn.execute(
-            "SELECT * FROM access_tokens WHERE token = ?",
+            "SELECT * FROM access_tokens WHERE token = %s",
             (token,)
         ).fetchone()
 
-    return dict(row)
+    return row
 
 
 def validate_payment_for_purchase(payment: dict, purchase_id: str) -> None:
@@ -551,7 +522,7 @@ def validate_payment_for_purchase(payment: dict, purchase_id: str) -> None:
 
     with get_db() as conn:
         purchase = conn.execute(
-            "SELECT * FROM purchases WHERE id = ?",
+            "SELECT * FROM purchases WHERE id = %s",
             (purchase_id,)
         ).fetchone()
 
@@ -579,10 +550,10 @@ def parse_auth_token(authorization: Optional[str]) -> str:
     return parts[1].strip()
 
 
-def get_active_access(token: str) -> sqlite3.Row:
+def get_active_access(token: str) -> dict:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT * FROM access_tokens WHERE token = ? AND active = 1",
+            "SELECT * FROM access_tokens WHERE token = %s AND active = 1",
             (token,)
         ).fetchone()
 
@@ -590,14 +561,15 @@ def get_active_access(token: str) -> sqlite3.Row:
         raise HTTPException(status_code=401, detail="Acceso inválido o inactivo.")
 
     expires_at = datetime.fromisoformat(row["expires_at"])
+
     if utcnow() > expires_at:
         with get_db() as conn:
-            conn.execute("UPDATE access_tokens SET active = 0 WHERE token = ?", (token,))
+            conn.execute("UPDATE access_tokens SET active = 0 WHERE token = %s", (token,))
         raise HTTPException(status_code=401, detail="El acceso ya venció.")
 
     if row["remaining_pages"] is not None and row["remaining_pages"] <= 0:
         with get_db() as conn:
-            conn.execute("UPDATE access_tokens SET active = 0 WHERE token = ?", (token,))
+            conn.execute("UPDATE access_tokens SET active = 0 WHERE token = %s", (token,))
         raise HTTPException(status_code=401, detail="El acceso ya no tiene páginas disponibles.")
 
     return row
@@ -620,6 +592,7 @@ def health():
     return {
         "status": "ok",
         "message": "ExcelLimpio backend activo",
+        "db_mode": "postgres",
         "plans": {
             code: {
                 "name": plan["name"],
@@ -725,7 +698,7 @@ async def convert(file: UploadFile = File(...), authorization: Optional[str] = H
             new_active = 0
 
         conn.execute(
-            "UPDATE access_tokens SET remaining_pages = ?, used_count = ?, active = ? WHERE token = ?",
+            "UPDATE access_tokens SET remaining_pages = %s, used_count = %s, active = %s WHERE token = %s",
             (new_remaining, new_used_count, new_active, token)
         )
 
