@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import io
 import os
 import re
@@ -20,10 +22,11 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.2.0")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.0")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://TU-SITIO.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
+MERCADO_PAGO_WEBHOOK_SECRET = os.getenv("MERCADO_PAGO_WEBHOOK_SECRET", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 app.add_middleware(
@@ -552,6 +555,44 @@ def activate_purchase_from_payment_id(payment_id: str):
     return create_access_token_for_purchase(purchase_id, payment_id)
 
 
+def parse_signature_header(signature_header: str) -> dict:
+    parts = [p.strip() for p in signature_header.split(",") if p.strip()]
+    data = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            data[k.strip()] = v.strip()
+    return data
+
+
+def is_valid_mercadopago_signature(
+    request: Request,
+    x_signature: Optional[str],
+    x_request_id: Optional[str],
+    data_id: str
+) -> bool:
+    if not MERCADO_PAGO_WEBHOOK_SECRET:
+        return False
+    if not x_signature or not x_request_id or not data_id:
+        return False
+
+    parsed = parse_signature_header(x_signature)
+    ts = parsed.get("ts")
+    v1 = parsed.get("v1")
+
+    if not ts or not v1:
+        return False
+
+    manifest = f"id:{data_id};request-id:{x_request_id};ts:{ts};"
+    expected = hmac.new(
+        MERCADO_PAGO_WEBHOOK_SECRET.encode("utf-8"),
+        manifest.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, v1)
+
+
 def parse_auth_token(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Falta Authorization Bearer token.")
@@ -604,6 +645,7 @@ def health():
         "status": "ok",
         "message": "ExcelLimpio backend activo",
         "db_mode": "postgres",
+        "webhook_secret_configured": bool(MERCADO_PAGO_WEBHOOK_SECRET),
         "plans": {
             code: {
                 "name": plan["name"],
@@ -645,7 +687,11 @@ def api_activate_payment(payload: ActivatePaymentRequest):
 
 
 @app.post("/webhooks/mercadopago")
-async def mercado_pago_webhook(request: Request):
+async def mercado_pago_webhook(
+    request: Request,
+    x_signature: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None),
+):
     try:
         body = await request.json()
     except Exception:
@@ -662,6 +708,7 @@ async def mercado_pago_webhook(request: Request):
         request.query_params.get("type")
         or (body.get("type") if isinstance(body, dict) else None)
         or (body.get("action") if isinstance(body, dict) else None)
+        or ""
     )
 
     if action and "payment" not in str(action):
@@ -678,6 +725,14 @@ async def mercado_pago_webhook(request: Request):
             "ignored": True,
             "reason": "payment_id not found"
         }
+
+    if not is_valid_mercadopago_signature(
+        request=request,
+        x_signature=x_signature,
+        x_request_id=x_request_id,
+        data_id=str(payment_id)
+    ):
+        raise HTTPException(status_code=401, detail="Firma inválida del webhook.")
 
     try:
         activate_purchase_from_payment_id(str(payment_id))
