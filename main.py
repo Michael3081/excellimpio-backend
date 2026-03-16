@@ -22,7 +22,7 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.0")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.1")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://TU-SITIO.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
@@ -251,26 +251,32 @@ def _extract_tables_filtered(page) -> List:
     return kept
 
 
-def _add_original_page_sheet(wb: Workbook, page, page_index: int, dpi: int = 150) -> None:
+def _add_original_page_sheet(
+    wb: Workbook,
+    page,
+    page_index: int,
+    temp_image_paths: List[str],
+    dpi: int = 150
+) -> None:
     ws = wb.create_sheet(title=f"ORIGINAL_p{page_index}")
     ws.sheet_view.showGridLines = False
+
     pil = page.to_image(resolution=dpi).original
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
         pil.save(f.name, format="PNG")
         img_path = f.name
-    try:
-        xlimg = XLImage(img_path)
-        xlimg.anchor = "A1"
-        ws.add_image(xlimg)
-        ws.column_dimensions["A"].width = 2
-        rows_needed = int(pil.height / 20) + 5
-        for r in range(1, rows_needed + 1):
-            ws.row_dimensions[r].height = 15
-    finally:
-        try:
-            os.remove(img_path)
-        except Exception:
-            pass
+
+    temp_image_paths.append(img_path)
+
+    xlimg = XLImage(img_path)
+    xlimg.anchor = "A1"
+    ws.add_image(xlimg)
+
+    ws.column_dimensions["A"].width = 2
+    rows_needed = int(pil.height / 20) + 5
+    for r in range(1, rows_needed + 1):
+        ws.row_dimensions[r].height = 15
 
 
 def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: bool = True) -> None:
@@ -352,20 +358,40 @@ def _add_text_fallback_sheet(wb: Workbook, page, sheet_name: str) -> None:
 def convert_pdf_to_xlsx_bytes(pdf_path: str) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            _add_original_page_sheet(wb, page, i, dpi=150)
-        for p_idx, page in enumerate(pdf.pages, start=1):
-            tables = _extract_tables_filtered(page)
-            if not tables:
-                _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}_text")
-                continue
-            for t_idx, table in enumerate(tables, start=1):
-                _add_table_sheet(wb, page, table, sheet_name=f"EDITABLE_p{p_idx}_t{t_idx}", style_header=True)
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
+
+    temp_image_paths: List[str] = []
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                _add_original_page_sheet(wb, page, i, temp_image_paths, dpi=150)
+
+            for p_idx, page in enumerate(pdf.pages, start=1):
+                tables = _extract_tables_filtered(page)
+                if not tables:
+                    _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}_text")
+                    continue
+
+                for t_idx, table in enumerate(tables, start=1):
+                    _add_table_sheet(
+                        wb,
+                        page,
+                        table,
+                        sheet_name=f"EDITABLE_p{p_idx}_t{t_idx}",
+                        style_header=True
+                    )
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        return bio.getvalue()
+
+    finally:
+        for img_path in temp_image_paths:
+            try:
+                os.remove(img_path)
+            except Exception:
+                pass
 
 
 def get_plan(plan_code: str):
@@ -820,7 +846,7 @@ async def convert(file: UploadFile = File(...), authorization: Optional[str] = H
         )
 
     out_name = re.sub(r"\.pdf$", "", os.path.basename(file.filename), flags=re.I) + "_ExcelLimpio.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
 
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
