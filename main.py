@@ -22,7 +22,7 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.3")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.4.0")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://excel-limpio.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
@@ -46,6 +46,11 @@ PLANS = {
 
 thin_side = Side(style="thin", color="000000")
 thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+header_fill = PatternFill("solid", fgColor="D9E2F3")
+section_fill = PatternFill("solid", fgColor="D9D9D9")
+title_fill = PatternFill("solid", fgColor="FFFFFF")
+header_font = Font(bold=True, color="000000")
+title_font = Font(bold=True, size=14, color="000000")
 
 
 class CheckoutRequest(BaseModel):
@@ -217,86 +222,29 @@ def _extract_tables_candidates(page) -> List:
     return out
 
 
-def _score_table_candidate(page, table) -> float:
+def _extract_layout_tables(page) -> List:
     try:
-        extracted = table.extract() or []
+        line_tables = page.find_tables(table_settings={
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5
+        })
     except Exception:
-        return -1e9
+        line_tables = []
 
-    texts: List[str] = []
-    for row in extracted:
-        for cell in row:
-            if cell is None:
-                continue
-            txt = re.sub(r"\s+", " ", str(cell)).strip()
-            if txt:
-                texts.append(txt)
+    if line_tables:
+        page_area = max(page.width * page.height, 1.0)
+        kept = []
+        for table in line_tables:
+            area_ratio = _bbox_area(table.bbox) / page_area
+            ncols, nrows = _table_grid_dims(table)
+            if area_ratio >= 0.01 and (ncols * nrows) >= 3:
+                kept.append(table)
+        if kept:
+            kept.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
+            return kept
 
-    if len(texts) < 8:
-        return -1e9
-
-    page_area = max(page.width * page.height, 1.0)
-    area_ratio = _bbox_area(table.bbox) / page_area
-
-    if area_ratio < 0.08:
-        return -1e9
-
-    avg_len = sum(len(t) for t in texts) / len(texts)
-    short_ratio = sum(1 for t in texts if len(t) <= 3) / len(texts)
-
-    ncols, nrows = _table_grid_dims(table)
-    fragmentation = (ncols * nrows) / max(len(texts), 1)
-
-    keywords = {
-        "proyecto", "código", "codigo", "fecha", "tema", "ubicación",
-        "ubicacion", "documento", "detalles", "contrato", "revisión",
-        "revision", "anexo", "referencia", "ncr"
-    }
-    keyword_hits = sum(
-        1 for t in texts
-        if any(k in t.lower() for k in keywords)
-    )
-
-    score = (
-        area_ratio * 1000
-        + avg_len * 8
-        - short_ratio * 60
-        - fragmentation * 5
-        + keyword_hits * 6
-    )
-    return score
-
-
-def _extract_tables_filtered(page) -> List:
-    candidates = _extract_tables_candidates(page)
-    if not candidates:
-        return []
-
-    scored = []
-    for table in candidates:
-        score = _score_table_candidate(page, table)
-        if score > -1e8:
-            scored.append((score, table))
-
-    if not scored:
-        return []
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    kept = []
-    for _score, table in scored:
-        skip = False
-        for kept_table in kept:
-            if _iou(table.bbox, kept_table.bbox) > 0.55:
-                skip = True
-                break
-        if not skip:
-            kept.append(table)
-        if len(kept) >= 1:
-            break
-
-    kept.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
-    return kept
+    return _extract_tables_candidates(page)
 
 
 def _add_original_page_sheet(
@@ -327,10 +275,25 @@ def _add_original_page_sheet(
         ws.row_dimensions[r].height = 15
 
 
-def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: bool = True) -> None:
-    ws = wb.create_sheet(title=sheet_name[:31])
-    ws.sheet_view.showGridLines = False
+def _style_range(ws, start_row: int, start_col: int, end_row: int, end_col: int, fill=None, font=None, alignment=None):
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            cell = ws.cell(r, c)
+            if fill is not None:
+                cell.fill = fill
+            if font is not None:
+                cell.font = font
+            if alignment is not None:
+                cell.alignment = alignment
 
+
+def _render_table_to_sheet(
+    ws,
+    page,
+    table,
+    start_row: int,
+    make_header_guess: bool = True,
+) -> int:
     xs: List[float] = []
     ys: List[float] = []
     for (x0, top, x1, bottom) in table.cells:
@@ -341,61 +304,121 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
     ys = sorted(_cluster(ys, tol=1.0))
 
     if len(xs) < 2 or len(ys) < 2:
-        return
+        return 0
 
-    col_pts = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
-    row_pts = [ys[j + 1] - ys[j] for j in range(len(ys) - 1)]
+    total_cols = len(xs) - 1
+    total_rows = len(ys) - 1
 
-    for i, wpt in enumerate(col_pts):
-        ws.column_dimensions[get_column_letter(1 + i)].width = _points_to_excel_col_width(wpt)
+    col_pts = [xs[i + 1] - xs[i] for i in range(total_cols)]
+    row_pts = [ys[j + 1] - ys[j] for j in range(total_rows)]
 
-    for j, hpt in enumerate(row_pts):
-        ws.row_dimensions[1 + j].height = max(6.0, min(hpt, 409.0))
+    for i, wpt in enumerate(col_pts, start=1):
+        col_letter = get_column_letter(i)
+        current = ws.column_dimensions[col_letter].width
+        target = _points_to_excel_col_width(wpt)
+        if current is None or target > current:
+            ws.column_dimensions[col_letter].width = target
 
-    wrap = Alignment(wrap_text=True, vertical="top")
+    base_align = Alignment(wrap_text=True, vertical="center")
+    center_align = Alignment(wrap_text=True, vertical="center", horizontal="center")
 
-    for r in range(1, len(ys)):
-        for c in range(1, len(xs)):
-            cell = ws.cell(row=r, column=c)
-            cell.alignment = wrap
-            cell.border = thin_border
+    for j, hpt in enumerate(row_pts, start=0):
+        ws.row_dimensions[start_row + j].height = max(18.0, min(hpt * 1.15, 90.0))
 
-    # Escribir texto sin combinar celdas para evitar error con MergedCell
+    placements = []
+    merges = []
+
     for bbox in table.cells:
         x0, top, x1, bottom = bbox
-        c0 = _find_index(xs, x0)
-        r0 = _find_index(ys, top)
-
-        start_col = c0 + 1
-        start_row = r0 + 1
+        c0 = _find_index(xs, x0) + 1
+        c1 = max(c0, _find_index(xs, x1))
+        r0 = _find_index(ys, top) + start_row
+        r1 = max(r0, _find_index(ys, bottom) + start_row - 1)
 
         txt = _extract_text_in_bbox(page, bbox)
-        if txt:
-            try:
-                cell = ws.cell(row=start_row, column=start_col)
-                if cell.value:
-                    current = str(cell.value).strip()
-                    if txt not in current:
-                        cell.value = f"{current}\n{txt}"
-                else:
-                    cell.value = txt
-                cell.alignment = wrap
-                cell.border = thin_border
-            except Exception:
-                pass
+        placements.append((r0, c0, r1, c1, txt))
 
-    if style_header:
-        vals = [ws.cell(row=1, column=c).value for c in range(1, len(xs))]
-        nonempty = sum(1 for v in vals if v and str(v).strip())
-        if nonempty >= max(2, (len(xs) - 1) // 2):
-            fill = PatternFill("solid", fgColor="0F172A")
-            font = Font(bold=True, color="FFFFFF")
-            center = Alignment(wrap_text=True, vertical="center", horizontal="center")
-            for c in range(1, len(xs)):
-                cell = ws.cell(row=1, column=c)
-                cell.fill = fill
-                cell.font = font
-                cell.alignment = center
+        if r1 > r0 or c1 > c0:
+            merges.append((r0, c0, r1, c1))
+
+    # escribir primero
+    for r0, c0, r1, c1, txt in placements:
+        cell = ws.cell(r0, c0)
+        if txt:
+            cell.value = txt
+        cell.alignment = base_align
+        cell.border = thin_border
+
+    # aplicar bordes al área completa
+    for r in range(start_row, start_row + total_rows):
+        for c in range(1, total_cols + 1):
+            ws.cell(r, c).border = thin_border
+            if ws.cell(r, c).alignment is None:
+                ws.cell(r, c).alignment = base_align
+
+    # combinar después de escribir
+    seen_merge = set()
+    for r0, c0, r1, c1 in merges:
+        key = (r0, c0, r1, c1)
+        if key in seen_merge:
+            continue
+        seen_merge.add(key)
+        try:
+            ws.merge_cells(start_row=r0, start_column=c0, end_row=r1, end_column=c1)
+        except Exception:
+            pass
+
+    # estilo por filas especiales
+    for r in range(start_row, start_row + total_rows):
+        values = []
+        non_empty_cols = []
+        for c in range(1, total_cols + 1):
+            val = ws.cell(r, c).value
+            if val is not None and str(val).strip():
+                values.append(str(val).strip())
+                non_empty_cols.append(c)
+
+        if not values:
+            continue
+
+        full_text = " ".join(values).lower()
+
+        # fila tipo título principal
+        if len(values) == 1 and len(values[0]) >= 12 and total_cols >= 3:
+            c = non_empty_cols[0]
+            _style_range(ws, r, c, r, min(total_cols, c + 1), fill=title_fill, font=title_font, alignment=center_align)
+
+        # fila tipo sección
+        if (
+            "detalles de ncr" in full_text
+            or "datos demográficos de métricas de calidad" in full_text
+            or "datos demograficos de metricas de calidad" in full_text
+            or "requerimientos técnicos" in full_text
+            or "requerimientos tecnicos" in full_text
+            or "condiciones existentes" in full_text
+        ):
+            _style_range(ws, r, 1, r, total_cols, fill=section_fill, font=header_font, alignment=center_align)
+
+        # cabecera de tabla de documentos
+        if (
+            "documentos de referencia" in full_text
+            or ("revisión" in full_text and "título" in full_text)
+            or ("revision" in full_text and "titulo" in full_text)
+        ):
+            _style_range(ws, r, 1, r, total_cols, fill=header_fill, font=header_font, alignment=center_align)
+
+        # cabeceras tipo etiqueta-valor
+        if make_header_guess and len(values) >= 2:
+            left = values[0].lower()
+            if any(k in left for k in [
+                "proyecto", "código", "codigo", "fecha", "tema", "ubicación", "ubicacion",
+                "número", "numero", "nombre del contrato", "disciplina", "subdisciplina",
+                "código causal", "codigo causal", "código subcausal", "codigo subcausal",
+                "código de producto", "codigo de producto"
+            ]):
+                ws.cell(r, non_empty_cols[0]).font = header_font
+
+    return total_rows
 
 
 def _add_text_fallback_sheet(wb: Workbook, page, sheet_name: str) -> None:
@@ -408,6 +431,31 @@ def _add_text_fallback_sheet(wb: Workbook, page, sheet_name: str) -> None:
         ws.cell(row=i, column=1, value=ln).alignment = Alignment(wrap_text=True, vertical="top")
 
 
+def _add_page_editable_sheet(wb: Workbook, page, page_index: int) -> None:
+    ws = wb.create_sheet(title=f"EDITABLE_p{page_index}")
+    ws.sheet_view.showGridLines = False
+
+    current_row = 1
+    tables = _extract_layout_tables(page)
+
+    if not tables:
+        _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{page_index}_text")
+        wb.remove(ws)
+        return
+
+    for table in tables:
+        rows_used = _render_table_to_sheet(
+            ws=ws,
+            page=page,
+            table=table,
+            start_row=current_row,
+            make_header_guess=True,
+        )
+        current_row += max(rows_used, 1) + 1
+
+    ws.freeze_panes = "A1"
+
+
 def convert_pdf_to_xlsx_bytes(pdf_path: str) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
@@ -417,25 +465,11 @@ def convert_pdf_to_xlsx_bytes(pdf_path: str) -> bytes:
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            # Primero crear las hojas editables buenas
             for p_idx, page in enumerate(pdf.pages, start=1):
-                tables = _extract_tables_filtered(page)
-
-                if not tables:
-                    _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}")
-                else:
-                    _add_table_sheet(
-                        wb,
-                        page,
-                        tables[0],
-                        sheet_name=f"EDITABLE_p{p_idx}",
-                        style_header=True
-                    )
-
+                _add_page_editable_sheet(wb, page, p_idx)
                 if first_editable_index is None:
                     first_editable_index = len(wb.worksheets) - 1
 
-            # Luego agregar las hojas originales al final
             for i, page in enumerate(pdf.pages, start=1):
                 _add_original_page_sheet(wb, page, i, temp_image_paths, dpi=150)
 
@@ -907,7 +941,7 @@ async def convert(file: UploadFile = File(...), authorization: Optional[str] = H
         )
 
     out_name = re.sub(r"\.pdf$", "", os.path.basename(file.filename), flags=re.I) + "_ExcelLimpio.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
 
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
