@@ -38,7 +38,7 @@ app.add_middleware(
 )
 
 PLANS = {
-    "p3": {"name": "Hasta 3 páginas", "price": 14.90, "max_pages": 3, "max_size_mb": 5, "duration_days": 1, "one_time": True},
+    "p3": {"name": "Hasta 3 páginas", "price": 9.90, "max_pages": 3, "max_size_mb": 5, "duration_days": 1, "one_time": True},
     "p10": {"name": "Hasta 10 páginas", "price": 24.90, "max_pages": 10, "max_size_mb": 10, "duration_days": 1, "one_time": True},
     "p25": {"name": "Hasta 25 páginas", "price": 39.90, "max_pages": 25, "max_size_mb": 20, "duration_days": 1, "one_time": True},
     "monthly": {"name": "Mensual 30 días", "price": 99.90, "max_pages": 300, "max_size_mb": 20, "duration_days": 30, "one_time": False},
