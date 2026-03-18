@@ -846,11 +846,10 @@ async def convert(file: UploadFile = File(...), authorization: Optional[str] = H
         )
 
     out_name = re.sub(r"\.pdf$", "", os.path.basename(file.filename), flags=re.I) + "_ExcelLimpio.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+    headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
 
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers
     )
-esta bien asi?? ԥ
