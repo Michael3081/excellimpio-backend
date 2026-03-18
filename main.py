@@ -22,7 +22,7 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.2")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.3")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://excel-limpio.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
@@ -217,36 +217,84 @@ def _extract_tables_candidates(page) -> List:
     return out
 
 
+def _score_table_candidate(page, table) -> float:
+    try:
+        extracted = table.extract() or []
+    except Exception:
+        return -1e9
+
+    texts: List[str] = []
+    for row in extracted:
+        for cell in row:
+            if cell is None:
+                continue
+            txt = re.sub(r"\s+", " ", str(cell)).strip()
+            if txt:
+                texts.append(txt)
+
+    if len(texts) < 8:
+        return -1e9
+
+    page_area = max(page.width * page.height, 1.0)
+    area_ratio = _bbox_area(table.bbox) / page_area
+
+    if area_ratio < 0.08:
+        return -1e9
+
+    avg_len = sum(len(t) for t in texts) / len(texts)
+    short_ratio = sum(1 for t in texts if len(t) <= 3) / len(texts)
+
+    ncols, nrows = _table_grid_dims(table)
+    fragmentation = (ncols * nrows) / max(len(texts), 1)
+
+    keywords = {
+        "proyecto", "código", "codigo", "fecha", "tema", "ubicación",
+        "ubicacion", "documento", "detalles", "contrato", "revisión",
+        "revision", "anexo", "referencia", "ncr"
+    }
+    keyword_hits = sum(
+        1 for t in texts
+        if any(k in t.lower() for k in keywords)
+    )
+
+    score = (
+        area_ratio * 1000
+        + avg_len * 8
+        - short_ratio * 60
+        - fragmentation * 5
+        + keyword_hits * 6
+    )
+    return score
+
+
 def _extract_tables_filtered(page) -> List:
     candidates = _extract_tables_candidates(page)
     if not candidates:
         return []
-    page_area = page.width * page.height
-    enriched = []
+
+    scored = []
     for table in candidates:
-        area = _bbox_area(table.bbox)
-        ncols, nrows = _table_grid_dims(table)
-        enriched.append((table, area, ncols, nrows))
-    filtered = []
-    for table, area, ncols, nrows in enriched:
-        grid = ncols * nrows
-        if area < 0.03 * page_area and grid < 16:
-            continue
-        filtered.append((table, area))
-    if not filtered:
-        tmax = max(enriched, key=lambda x: x[1])[0]
-        return [tmax]
-    filtered.sort(key=lambda x: x[1], reverse=True)
+        score = _score_table_candidate(page, table)
+        if score > -1e8:
+            scored.append((score, table))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
     kept = []
-    for table, _area in filtered:
-        bbox = table.bbox
+    for _score, table in scored:
         skip = False
         for kept_table in kept:
-            if _bbox_contains(kept_table.bbox, bbox, margin=1) and _iou(kept_table.bbox, bbox) > 0.85:
+            if _iou(table.bbox, kept_table.bbox) > 0.55:
                 skip = True
                 break
         if not skip:
             kept.append(table)
+        if len(kept) >= 1:
+            break
+
     kept.sort(key=lambda t: (t.bbox[1], t.bbox[0]))
     return kept
 
@@ -325,7 +373,12 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
         if txt:
             try:
                 cell = ws.cell(row=start_row, column=start_col)
-                cell.value = txt
+                if cell.value:
+                    current = str(cell.value).strip()
+                    if txt not in current:
+                        cell.value = f"{current}\n{txt}"
+                else:
+                    cell.value = txt
                 cell.alignment = wrap
                 cell.border = thin_border
             except Exception:
@@ -360,26 +413,34 @@ def convert_pdf_to_xlsx_bytes(pdf_path: str) -> bytes:
     wb.remove(wb.active)
 
     temp_image_paths: List[str] = []
+    first_editable_index: Optional[int] = None
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages, start=1):
-                _add_original_page_sheet(wb, page, i, temp_image_paths, dpi=150)
-
+            # Primero crear las hojas editables buenas
             for p_idx, page in enumerate(pdf.pages, start=1):
                 tables = _extract_tables_filtered(page)
-                if not tables:
-                    _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}_text")
-                    continue
 
-                for t_idx, table in enumerate(tables, start=1):
+                if not tables:
+                    _add_text_fallback_sheet(wb, page, sheet_name=f"EDITABLE_p{p_idx}")
+                else:
                     _add_table_sheet(
                         wb,
                         page,
-                        table,
-                        sheet_name=f"EDITABLE_p{p_idx}_t{t_idx}",
+                        tables[0],
+                        sheet_name=f"EDITABLE_p{p_idx}",
                         style_header=True
                     )
+
+                if first_editable_index is None:
+                    first_editable_index = len(wb.worksheets) - 1
+
+            # Luego agregar las hojas originales al final
+            for i, page in enumerate(pdf.pages, start=1):
+                _add_original_page_sheet(wb, page, i, temp_image_paths, dpi=150)
+
+        if first_editable_index is not None:
+            wb.active = first_editable_index
 
         bio = io.BytesIO()
         wb.save(bio)
