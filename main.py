@@ -22,9 +22,9 @@ from openpyxl.utils import get_column_letter
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.1")
+app = FastAPI(title="ExcelLimpio Backend v2", version="2.3.2")
 
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://TU-SITIO.netlify.app").rstrip("/")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://excel-limpio.netlify.app").rstrip("/")
 MERCADO_PAGO_ACCESS_TOKEN = os.getenv("MERCADO_PAGO_ACCESS_TOKEN", "").strip()
 MERCADO_PAGO_WEBHOOK_SECRET = os.getenv("MERCADO_PAGO_WEBHOOK_SECRET", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -282,13 +282,16 @@ def _add_original_page_sheet(
 def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: bool = True) -> None:
     ws = wb.create_sheet(title=sheet_name[:31])
     ws.sheet_view.showGridLines = False
+
     xs: List[float] = []
     ys: List[float] = []
     for (x0, top, x1, bottom) in table.cells:
         xs.extend([x0, x1])
         ys.extend([top, bottom])
+
     xs = sorted(_cluster(xs, tol=1.0))
     ys = sorted(_cluster(ys, tol=1.0))
+
     if len(xs) < 2 or len(ys) < 2:
         return
 
@@ -302,34 +305,31 @@ def _add_table_sheet(wb: Workbook, page, table, sheet_name: str, style_header: b
         ws.row_dimensions[1 + j].height = max(6.0, min(hpt, 409.0))
 
     wrap = Alignment(wrap_text=True, vertical="top")
+
     for r in range(1, len(ys)):
         for c in range(1, len(xs)):
             cell = ws.cell(row=r, column=c)
             cell.alignment = wrap
             cell.border = thin_border
 
+    # Escribir texto sin combinar celdas para evitar error con MergedCell
     for bbox in table.cells:
         x0, top, x1, bottom = bbox
         c0 = _find_index(xs, x0)
-        c1 = _find_index(xs, x1)
         r0 = _find_index(ys, top)
-        r1 = _find_index(ys, bottom)
-        start_col = c0 + 1
-        end_col = max(start_col, c1)
-        start_row = r0 + 1
-        end_row = max(start_row, r1)
 
-        if end_row > start_row or end_col > start_col:
-            ws.merge_cells(
-                start_row=start_row,
-                start_column=start_col,
-                end_row=end_row,
-                end_column=end_col
-            )
+        start_col = c0 + 1
+        start_row = r0 + 1
 
         txt = _extract_text_in_bbox(page, bbox)
         if txt:
-            ws.cell(row=start_row, column=start_col, value=txt)
+            try:
+                cell = ws.cell(row=start_row, column=start_col)
+                cell.value = txt
+                cell.alignment = wrap
+                cell.border = thin_border
+            except Exception:
+                pass
 
     if style_header:
         vals = [ws.cell(row=1, column=c).value for c in range(1, len(xs))]
@@ -846,10 +846,11 @@ async def convert(file: UploadFile = File(...), authorization: Optional[str] = H
         )
 
     out_name = re.sub(r"\.pdf$", "", os.path.basename(file.filename), flags=re.I) + "_ExcelLimpio.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
+    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
 
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers
     )
+esta bien asi?? ԥ
